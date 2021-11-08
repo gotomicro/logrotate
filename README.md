@@ -1,5 +1,6 @@
 Fork From: https://github.com/natefinch/lumberjack
 * 原版版本号存在问题
+* 支持按时间轮转，但默认不开启，因为耗费性能  
 * 备份日志结尾是log，会影响到日志采集，备份日志改为时间结尾
 
 # lumberjack  [![GoDoc](https://godoc.org/gopkg.in/natefinch/lumberjack.v2?status.png)](https://godoc.org/gopkg.in/natefinch/lumberjack.v2) [![Build Status](https://travis-ci.org/natefinch/lumberjack.svg?branch=v2.0)](https://travis-ci.org/natefinch/lumberjack) [![Build status](https://ci.appveyor.com/api/projects/status/00gchpxtg4gkrt5d)](https://ci.appveyor.com/project/natefinch/lumberjack) [![Coverage Status](https://coveralls.io/repos/natefinch/lumberjack/badge.svg?branch=v2.0)](https://coveralls.io/r/natefinch/lumberjack?branch=v2.0)

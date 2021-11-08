@@ -1,4 +1,4 @@
-package lumberjack
+package logrotate
 
 import (
 	"fmt"
