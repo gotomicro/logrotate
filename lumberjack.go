@@ -1,4 +1,4 @@
-// Package lumberjack provides a rolling logger.
+// Package logrotate provides a rolling logger.
 //
 // Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
 // thusly:
@@ -19,7 +19,7 @@
 // Lumberjack assumes that only one process is writing to the output files.
 // Using the same lumberjack configuration from multiple processes on the same
 // machine will result in improper behavior.
-package lumberjack
+package logrotate
 
 import (
 	"compress/gzip"
@@ -47,7 +47,7 @@ var _ io.WriteCloser = (*Logger)(nil)
 // Logger is an io.WriteCloser that writes to the specified filename.
 //
 // Logger opens or creates the logfile on first Write.  If the file exists and
-// is less than MaxSize megabytes, lumberjack will open and append to that file.
+// is less than MaxSize megabytes, rotate will open and append to that file.
 // If the file exists and its size is >= MaxSize megabytes, the file is renamed
 // by putting the current time in a timestamp in the name immediately before the
 // file's extension (or the end of the filename if there's no extension). A new
@@ -78,7 +78,7 @@ var _ io.WriteCloser = (*Logger)(nil)
 // If MaxBackups and MaxAge are both 0, no old log files will be deleted.
 type Logger struct {
 	// Filename is the file to write logs to.  Backup log files will be retained
-	// in the same directory.  It uses <processname>-lumberjack.log in
+	// in the same directory.  It uses <processname>-rotate.log in
 	// os.TempDir() if empty.
 	Filename string `json:"filename" yaml:"filename"`
 
@@ -107,9 +107,14 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
-	size int64
-	file *os.File
-	mu   sync.Mutex
+	// RotateInterval determines the duration to rotate log files.
+	// The default is not to rotate log files based on time.
+	RotateInterval time.Duration `json:"rotateInterval" yaml:"rotateInterval"`
+
+	size  int64
+	ctime time.Time
+	file  *os.File
+	mu    sync.Mutex
 
 	millCh    chan bool
 	startMill sync.Once
@@ -119,7 +124,7 @@ var (
 	// currentTime exists so it can be mocked out by tests.
 	currentTime = time.Now
 
-	// os_Stat exists so it can be mocked out by tests.
+	// osStat exists so it can be mocked out by tests.
 	osStat = os.Stat
 
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
@@ -152,6 +157,16 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	if l.size+writeLen > l.max() {
 		if err := l.rotate(); err != nil {
 			return 0, err
+		}
+	}
+	// 支持时间轮转
+	if l.RotateInterval > 0 {
+		cutoff := currentTime().Add(-1 * l.RotateInterval)
+
+		if l.ctime.Before(cutoff) {
+			if err := l.rotate(); err != nil {
+				return 0, err
+			}
 		}
 	}
 
@@ -212,7 +227,7 @@ func (l *Logger) openNew() error {
 	}
 
 	name := l.filename()
-	mode := os.FileMode(0600)
+	mode := os.FileMode(0644)
 	info, err := osStat(name)
 	if err == nil {
 		// Copy the mode off the old logfile.
@@ -238,6 +253,7 @@ func (l *Logger) openNew() error {
 	}
 	l.file = f
 	l.size = 0
+	l.ctime = currentTime()
 	return nil
 }
 
@@ -255,7 +271,7 @@ func backupName(name string, local bool) string {
 	}
 
 	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	return filepath.Join(dir, fmt.Sprintf("%s%s.%s", prefix, ext, timestamp))
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -285,6 +301,10 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	}
 	l.file = file
 	l.size = info.Size()
+	if ct, err := createTime(file); err == nil {
+		l.ctime = ct
+	}
+
 	return nil
 }
 
@@ -293,7 +313,7 @@ func (l *Logger) filename() string {
 	if l.Filename != "" {
 		return l.Filename
 	}
-	name := filepath.Base(os.Args[0]) + "-lumberjack.log"
+	name := filepath.Base(os.Args[0]) + "-rotate.log"
 	return filepath.Join(os.TempDir(), name)
 }
 
@@ -320,9 +340,8 @@ func (l *Logger) millRunOnce() error {
 			// Only count the uncompressed log file or the
 			// compressed log file, not both.
 			fn := f.Name()
-			if strings.HasSuffix(fn, compressSuffix) {
-				fn = fn[:len(fn)-len(compressSuffix)]
-			}
+			fn = strings.TrimSuffix(fn, compressSuffix)
+
 			preserved[fn] = true
 
 			if len(preserved) > l.MaxBackups {
@@ -414,12 +433,8 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 			logFiles = append(logFiles, logInfo{t, f})
 			continue
 		}
-		if t, err := l.timeFromName(f.Name(), prefix, ext+compressSuffix); err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
-			continue
-		}
 		// error parsing means that the suffix at the end was not generated
-		// by lumberjack, and therefore it's not a backup file.
+		// by rotate, and therefore it's not a backup file.
 	}
 
 	sort.Sort(byFormatTime(logFiles))
@@ -431,13 +446,18 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 // the filename's prefix and extension. This prevents someone's filename from
 // confusing time.parse.
 func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
-	if !strings.HasPrefix(filename, prefix) {
+	if filename == prefix+ext {
+		return time.Time{}, errors.New("not old file")
+	}
+	if !strings.HasPrefix(filename, prefix+ext) {
 		return time.Time{}, errors.New("mismatched prefix")
 	}
-	if !strings.HasSuffix(filename, ext) {
-		return time.Time{}, errors.New("mismatched extension")
+	var ts string
+	if !strings.HasSuffix(filename, compressSuffix) {
+		ts = filename[len(prefix)+len(ext)+1:]
+	} else {
+		ts = filename[len(prefix)+len(ext)+1 : len(filename)-len(compressSuffix)]
 	}
-	ts := filename[len(prefix) : len(filename)-len(ext)]
 	return time.Parse(backupTimeFormat, ts)
 }
 
@@ -459,7 +479,7 @@ func (l *Logger) dir() string {
 func (l *Logger) prefixAndExt() (prefix, ext string) {
 	filename := filepath.Base(l.filename())
 	ext = filepath.Ext(filename)
-	prefix = filename[:len(filename)-len(ext)] + "-"
+	prefix = filename[:len(filename)-len(ext)]
 	return prefix, ext
 }
 
@@ -511,11 +531,8 @@ func compressLogFile(src, dst string) (err error) {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Remove(src); err != nil {
-		return err
-	}
 
-	return nil
+	return os.Remove(src)
 }
 
 // logInfo is a convenience struct to return the filename and its embedded
@@ -528,14 +545,17 @@ type logInfo struct {
 // byFormatTime sorts by newest time formatted in the name.
 type byFormatTime []logInfo
 
+// Less ...
 func (b byFormatTime) Less(i, j int) bool {
 	return b[i].timestamp.After(b[j].timestamp)
 }
 
+// Swap ...
 func (b byFormatTime) Swap(i, j int) {
 	b[i], b[j] = b[j], b[i]
 }
 
+// Len ...
 func (b byFormatTime) Len() int {
 	return len(b)
 }
